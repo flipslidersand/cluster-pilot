@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/robfig/cron/v3"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -35,8 +36,8 @@ func (r *DataPipelineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Terminal state: only Succeeded. Failed may have retries.
-	if pipeline.Status.Phase == pilotv1.DataPipelineSucceeded {
+	// Terminal state: only Succeeded (and not scheduled). Failed may have retries, Scheduled continue.
+	if pipeline.Status.Phase == pilotv1.DataPipelineSucceeded && pipeline.Spec.Schedule == "" {
 		return ctrl.Result{}, nil
 	}
 
@@ -60,7 +61,17 @@ func (r *DataPipelineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	return r.syncStatus(ctx, logger, pipeline, job)
+	result, err := r.syncStatus(ctx, logger, pipeline, job)
+	if err != nil {
+		return result, err
+	}
+
+	// If scheduled and terminal, schedule next run.
+	if pipeline.Spec.Schedule != "" && (pipeline.Status.Phase == pilotv1.DataPipelineSucceeded || pipeline.Status.Phase == pilotv1.DataPipelineFailed) {
+		return r.scheduleNext(ctx, pipeline)
+	}
+
+	return result, nil
 }
 
 func (r *DataPipelineReconciler) createJob(ctx context.Context, p *pilotv1.DataPipeline, name string) (ctrl.Result, error) {
@@ -134,6 +145,29 @@ func (r *DataPipelineReconciler) syncStatus(
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func (r *DataPipelineReconciler) scheduleNext(ctx context.Context, p *pilotv1.DataPipeline) (ctrl.Result, error) {
+	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	schedule, err := parser.Parse(p.Spec.Schedule)
+	if err != nil {
+		p.Status.Message = fmt.Sprintf("invalid cron expression: %v", err)
+		_ = r.Status().Update(ctx, p)
+		return ctrl.Result{}, nil
+	}
+
+	nextRun := schedule.Next(time.Now())
+	nextTime := metav1.NewTime(nextRun)
+	p.Status.NextRunTime = &nextTime
+	p.Status.Phase = pilotv1.DataPipelinePending
+	p.Status.Runs = 0
+	p.Status.Message = fmt.Sprintf("scheduled for %s", nextRun.Format(time.RFC3339))
+	if err := r.Status().Update(ctx, p); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	waitDur := time.Until(nextRun)
+	return ctrl.Result{RequeueAfter: waitDur}, nil
 }
 
 func (r *DataPipelineReconciler) desiredJob(p *pilotv1.DataPipeline, name string) *batchv1.Job {
