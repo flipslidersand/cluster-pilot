@@ -48,6 +48,10 @@ type DataPipelineStatus struct {
 	// +optional
 	LastSuccessTime *metav1.Time `json:"lastSuccessTime,omitempty"`
 
+	// NextRunTime (for scheduled pipelines) records when the next execution is planned.
+	// +optional
+	NextRunTime *metav1.Time `json:"nextRunTime,omitempty"`
+
 	// Message is a human-readable description of the current status.
 	// +optional
 	Message string `json:"message,omitempty"`

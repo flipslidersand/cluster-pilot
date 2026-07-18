@@ -88,6 +88,10 @@ func (in *DataPipelineStatus) DeepCopyInto(out *DataPipelineStatus) {
 		in, out := &in.LastSuccessTime, &out.LastSuccessTime
 		*out = (*in).DeepCopy()
 	}
+	if in.NextRunTime != nil {
+		in, out := &in.NextRunTime, &out.NextRunTime
+		*out = (*in).DeepCopy()
+	}
 }
 
 func (in *DataPipelineStatus) DeepCopy() *DataPipelineStatus {
