@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -34,9 +35,8 @@ func (r *DataPipelineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Terminal states — nothing to do.
-	if pipeline.Status.Phase == pilotv1.DataPipelineSucceeded ||
-		pipeline.Status.Phase == pilotv1.DataPipelineFailed {
+	// Terminal state: only Succeeded. Failed may have retries.
+	if pipeline.Status.Phase == pilotv1.DataPipelineSucceeded {
 		return ctrl.Result{}, nil
 	}
 
@@ -51,7 +51,15 @@ func (r *DataPipelineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	// Job exists — mirror its outcome into Status.
+	// Job exists — check timeout, retries, then sync status.
+	if err := r.checkTimeout(ctx, pipeline, job); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.checkRetry(ctx, pipeline, job); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	return r.syncStatus(ctx, logger, pipeline, job)
 }
 
@@ -71,6 +79,38 @@ func (r *DataPipelineReconciler) createJob(ctx context.Context, p *pilotv1.DataP
 	p.Status.Runs++
 	p.Status.LastRunTime = &now
 	return ctrl.Result{}, r.Status().Update(ctx, p)
+}
+
+func (r *DataPipelineReconciler) checkTimeout(ctx context.Context, p *pilotv1.DataPipeline, job *batchv1.Job) error {
+	if p.Spec.Timeout == nil || p.Status.LastRunTime == nil {
+		return nil
+	}
+	expiry := p.Status.LastRunTime.Add(p.Spec.Timeout.Duration)
+	if time.Now().After(expiry) && job.Status.Active > 0 {
+		if err := r.Delete(ctx, job); err != nil {
+			return err
+		}
+		p.Status.Phase = pilotv1.DataPipelineFailed
+		p.Status.Message = "timeout exceeded"
+		return r.Status().Update(ctx, p)
+	}
+	return nil
+}
+
+func (r *DataPipelineReconciler) checkRetry(ctx context.Context, p *pilotv1.DataPipeline, job *batchv1.Job) error {
+	if job.Status.Failed == 0 {
+		return nil
+	}
+	maxAttempts := int32(p.Spec.Retries) + 1
+	if p.Status.Runs < maxAttempts {
+		if err := r.Delete(ctx, job); err != nil {
+			return err
+		}
+		newJobName := fmt.Sprintf("%s-run-%d", p.Name, p.Status.Runs+1)
+		_, err := r.createJob(ctx, p, newJobName)
+		return err
+	}
+	return nil
 }
 
 func (r *DataPipelineReconciler) syncStatus(
@@ -97,7 +137,7 @@ func (r *DataPipelineReconciler) syncStatus(
 }
 
 func (r *DataPipelineReconciler) desiredJob(p *pilotv1.DataPipeline, name string) *batchv1.Job {
-	return &batchv1.Job{
+	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: p.Namespace,
@@ -120,6 +160,11 @@ func (r *DataPipelineReconciler) desiredJob(p *pilotv1.DataPipeline, name string
 			},
 		},
 	}
+	if p.Spec.Timeout != nil {
+		secs := int64(p.Spec.Timeout.Seconds())
+		job.Spec.ActiveDeadlineSeconds = &secs
+	}
+	return job
 }
 
 func (r *DataPipelineReconciler) SetupWithManager(mgr ctrl.Manager) error {
