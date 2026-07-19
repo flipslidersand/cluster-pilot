@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/robfig/cron/v3"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -22,6 +25,10 @@ import (
 type DataPipelineReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// Metrics
+	reconcileTotal   prometheus.Counter
+	pipelineDuration prometheus.Histogram
+	tracer           trace.Tracer
 }
 
 // +kubebuilder:rbac:groups=clusterpilot.dev,resources=datapipelines,verbs=get;list;watch;create;update;patch;delete
@@ -30,6 +37,22 @@ type DataPipelineReconciler struct {
 
 func (r *DataPipelineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+	start := time.Now()
+	defer func() {
+		duration := time.Since(start).Seconds()
+		if r.reconcileTotal != nil {
+			r.reconcileTotal.Inc()
+		}
+		if r.pipelineDuration != nil {
+			r.pipelineDuration.Observe(duration)
+		}
+	}()
+
+	if r.tracer != nil {
+		var span trace.Span
+		ctx, span = r.tracer.Start(ctx, "Reconcile")
+		defer span.End()
+	}
 
 	pipeline := &pilotv1.DataPipeline{}
 	if err := r.Get(ctx, req.NamespacedName, pipeline); err != nil {
@@ -201,7 +224,31 @@ func (r *DataPipelineReconciler) desiredJob(p *pilotv1.DataPipeline, name string
 	return job
 }
 
+func (r *DataPipelineReconciler) SetupMetrics() error {
+	var err error
+	r.reconcileTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "datapipeline_reconcile_total",
+		Help: "Total number of DataPipeline reconciliations",
+	})
+	if err = prometheus.Register(r.reconcileTotal); err != nil {
+		// Counter already registered, that's okay
+	}
+
+	r.pipelineDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "datapipeline_reconcile_duration_seconds",
+		Help:    "Reconciliation duration in seconds",
+		Buckets: prometheus.ExponentialBuckets(0.01, 2, 10),
+	})
+	if err = prometheus.Register(r.pipelineDuration); err != nil {
+		// Histogram already registered, that's okay
+	}
+
+	r.tracer = otel.Tracer("cluster-pilot")
+	return nil
+}
+
 func (r *DataPipelineReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	_ = r.SetupMetrics()
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pilotv1.DataPipeline{}).
 		Owns(&batchv1.Job{}).
