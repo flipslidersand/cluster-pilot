@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: [self-hosted, dev-nodee-local]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false # self-hosted: ローカルGOCACHEを再利用するため actions/cache 経由の保存は不要（初回5GB超のアップロードでジョブが長時間化する）
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./... -race
